@@ -16,15 +16,19 @@ WORKDIR="$(pwd)"
 SOURCE_DIR=""
 DISPLAY_PREFIX="ai_constraints"
 VERIFY_COMMAND="bash ai_constraints/scripts/verify.sh [file ...]"
+ENTRY_LINE="@ai_constraints/codex/入口.md"
 
 # 先识别当前是在项目根调用，还是在模板目录里直接调用。
 if [ -d "$WORKDIR/ai_constraints/codex" ] && [ -f "$WORKDIR/ai_constraints/setup.sh" ]; then
     SOURCE_DIR="$WORKDIR/ai_constraints"
     DISPLAY_PREFIX="ai_constraints"
+    ENTRY_LINE="@ai_constraints/codex/入口.md"
 elif [ -d "$WORKDIR/codex" ] && [ -f "$WORKDIR/setup.sh" ]; then
     SOURCE_DIR="$WORKDIR"
     DISPLAY_PREFIX="."
     VERIFY_COMMAND="bash scripts/verify.sh [file ...]"
+    # 中文注释：模板仓库自测时没有外层 ai_constraints 目录，入口应直接指向本仓库的 codex/入口.md。
+    ENTRY_LINE="@codex/入口.md"
 else
     echo -e "${RED}❌ 未找到可安装的 ai_constraints 模板${NC}"
     echo "   请在项目根执行：bash ai_constraints/setup.sh"
@@ -47,10 +51,9 @@ if [ -f "$SOURCE_DIR/scripts/verify.sh" ]; then
     chmod +x "$SOURCE_DIR/scripts/verify.sh"
 fi
 
-# 项目根入口只保留 AGENTS.md，并固定引用 Codex 主入口。
+# 当前工作目录入口只保留 AGENTS.md，并按运行位置引用 Codex 主入口。
 echo -e "${BLUE}3. 生成项目根入口${NC}"
 ENTRY_FILE="$WORKDIR/AGENTS.md"
-ENTRY_LINE="@ai_constraints/codex/入口.md"
 
 if [ -f "$ENTRY_FILE" ]; then
     if grep -Fxq "$ENTRY_LINE" "$ENTRY_FILE"; then
@@ -70,7 +73,7 @@ echo "接下来手动完成："
 echo -e "  1. 编辑 ${BLUE}${DISPLAY_PREFIX}/codex/入口.md${NC} — 填项目名、项目快照和会话规则"
 echo -e "  2. 编辑 ${BLUE}${DISPLAY_PREFIX}/codex/任务池.md${NC} — 按表格看板填任务、Owner、Scope、验证和验收"
 echo -e "  3. 编辑 ${BLUE}${DISPLAY_PREFIX}/codex/架构.md${NC} — 填业务模块地图和依赖"
-echo -e "  4. 按需编辑 ${BLUE}${DISPLAY_PREFIX}/codex/子代理.md${NC} — 调整 Main Agent 派发规则和子代理权限"
+echo -e "  4. 按需编辑 ${BLUE}${DISPLAY_PREFIX}/codex/子代理.md${NC} — 调整 Main Agent 派发决策规则和子代理权限"
 echo -e "  5. 为每个业务模块补齐 ${BLUE}${DISPLAY_PREFIX}/codex/模块/${NC} 下的文档"
 echo ""
 echo "日常命令："
