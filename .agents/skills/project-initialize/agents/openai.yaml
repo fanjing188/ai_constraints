@@ -1,0 +1,6 @@
+interface:
+  display_name: "项目初始化"
+  short_description: "全仓扫描并生成模块、依赖与验证档案"
+  default_prompt: "使用 $project-initialize 初始化当前项目的 AI Constraints 工作包。"
+policy:
+  allow_implicit_invocation: false
