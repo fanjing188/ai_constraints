@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
@@ -40,6 +42,9 @@ EXCLUDED_DIRECTORY_REASONS = {
 # 先按路径排除秘密，确保脚本不会为了判断文本类型而打开秘密文件。
 SECRET_BASENAMES = {
     ".env",
+    ".authinfo",
+    ".envrc",
+    ".netrc",
     ".npmrc",
     ".pypirc",
     "credentials",
@@ -49,8 +54,23 @@ SECRET_BASENAMES = {
     "id_ecdsa",
     "id_ed25519",
     "id_rsa",
+    "kubeconfig",
+    "service-account.json",
 }
 SECRET_SUFFIXES = {".key", ".p12", ".pfx", ".pem", ".jks", ".keystore"}
+SECRET_DIRECTORY_NAMES = {".aws", ".azure", ".gcloud", "gcloud"}
+SECRET_PATH_SUFFIXES = {
+    (".config", "gh", "hosts.yaml"),
+    (".config", "gh", "hosts.yml"),
+    (".docker", "config.json"),
+    (".kube", "config"),
+}
+SECRET_NAME_PATTERN = re.compile(
+    r"(?:^|[._-])(?:auth|credentials?|secrets?|tokens?)(?:$|[._-])", re.IGNORECASE
+)
+SECRET_SERVICE_NAME_PATTERN = re.compile(
+    r"^(?:kubeconfig|service[-_]account)(?:$|[._-])", re.IGNORECASE
+)
 
 # 明确的二进制扩展名可在不读取内容的情况下排除。
 BINARY_SUFFIXES = {
@@ -93,6 +113,66 @@ BINARY_SUFFIXES = {
     ".xlsx",
     ".zip",
 }
+
+STRUCTURAL_ENTRY_BASENAMES = {
+    ".gitlab-ci.yml",
+    ".gitlab-ci.yaml",
+    "azure-pipelines.yml",
+    "azure-pipelines.yaml",
+    "build.gradle",
+    "build.gradle.kts",
+    "build.rs",
+    "cargo.toml",
+    "cmakelists.txt",
+    "compose.yaml",
+    "compose.yml",
+    "conftest.py",
+    "deno.json",
+    "deno.jsonc",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+    "dockerfile",
+    "go.mod",
+    "gradle.properties",
+    "jest.config.js",
+    "jest.config.mjs",
+    "jest.config.ts",
+    "makefile",
+    "meson.build",
+    "noxfile.py",
+    "package.json",
+    "playwright.config.cjs",
+    "playwright.config.js",
+    "playwright.config.mjs",
+    "playwright.config.ts",
+    "pom.xml",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "setup.py",
+    "tox.ini",
+    "vitest.config.js",
+    "vitest.config.mjs",
+    "vitest.config.ts",
+}
+STRUCTURAL_CI_BASENAMES = {
+    ".travis.yaml",
+    ".travis.yml",
+    "jenkinsfile",
+}
+STRUCTURAL_PATH_TOKEN_KINDS = {
+    "registries": "共享注册表",
+    "registry": "共享注册表",
+    "schema": "schema",
+    "schemas": "schema",
+}
+STRUCTURAL_REGISTRY_SEGMENTS = {
+    "registries",
+    "registry",
+    "shared-registries",
+    "shared-registry",
+}
+PLAYWRIGHT_CONFIG_SUFFIXES = {"cjs", "cts", "js", "jsx", "mjs", "mts", "ts", "tsx"}
 
 GENERATED_START = "<!-- ai-constraints:generated:start -->"
 GENERATED_END = "<!-- ai-constraints:generated:end -->"
@@ -160,12 +240,26 @@ def _is_secret_path(relative_path: str) -> bool:
     """只根据路径识别秘密；匹配后绝不读取文件内容。"""
 
     path = PurePosixPath(relative_path)
+    lowered_parts = tuple(part.lower() for part in path.parts)
     name = path.name.lower()
     if name == ".env" or name.startswith(".env."):
         return True
-    if name in SECRET_BASENAMES or path.suffix.lower() in SECRET_SUFFIXES:
+    if (
+        any(
+            len(lowered_parts) >= len(suffix)
+            and lowered_parts[-len(suffix) :] == suffix
+            for suffix in SECRET_PATH_SUFFIXES
+        )
+        or name in SECRET_BASENAMES
+        or path.suffix.lower() in SECRET_SUFFIXES
+        or SECRET_NAME_PATTERN.search(name)
+        or SECRET_SERVICE_NAME_PATTERN.search(name)
+    ):
         return True
-    return any(part.lower() in {".secrets", "secrets"} for part in path.parts[:-1])
+    return any(
+        part.lower() in {".secrets", "secrets"} | SECRET_DIRECTORY_NAMES
+        for part in path.parts[:-1]
+    )
 
 
 def _looks_minified(relative_path: str, data: bytes) -> bool:
@@ -213,6 +307,28 @@ def _record_exclusion(
 
     excluded_files.append({"path": relative_path, "reason": reason})
     counts[reason] = counts.get(reason, 0) + 1
+
+
+def _excluded_entry_metadata(path: Path, relative_path: str) -> dict[str, Any]:
+    """只用 lstat 记录排除项元数据，不跟随链接也不读取文件内容。"""
+
+    try:
+        details = path.lstat()
+    except OSError as exc:
+        raise InventoryError(f"无法读取排除项元数据 {relative_path}：{exc}") from exc
+    if stat.S_ISREG(details.st_mode):
+        file_type = "file"
+    elif stat.S_ISLNK(details.st_mode):
+        file_type = "symlink"
+    elif stat.S_ISDIR(details.st_mode):
+        file_type = "directory"
+    else:
+        file_type = "special"
+    return {
+        "file_type": file_type,
+        "mtime_ns": details.st_mtime_ns,
+        "size": details.st_size,
+    }
 
 
 def _iter_project_entries(project_root: Path) -> Iterable[tuple[Path, str, str | None]]:
@@ -264,7 +380,10 @@ def _status_path_in_scope(relative_path: str) -> bool:
     parts = PurePosixPath(relative_path).parts
     if not parts or parts[0] == PACKAGE_DIRECTORY:
         return False
-    return not any(part in EXCLUDED_DIRECTORY_REASONS for part in parts[:-1])
+    lowered_directories = {part.lower() for part in parts[:-1]}
+    return "ci" in lowered_directories or not any(
+        part in EXCLUDED_DIRECTORY_REASONS for part in parts[:-1]
+    )
 
 
 def _git_worktree_changes(project_root: Path) -> list[dict[str, str]]:
@@ -302,6 +421,7 @@ def scan_project(project_root: Path | str) -> dict[str, Any]:
     fingerprints: dict[str, str] = {}
     excluded_files: list[dict[str, str]] = []
     excluded_counts: dict[str, int] = {}
+    excluded_metadata: dict[str, dict[str, Any]] = {}
 
     for path, relative, directory_reason in _iter_project_entries(root):
         if directory_reason:
@@ -309,16 +429,20 @@ def scan_project(project_root: Path | str) -> dict[str, Any]:
             continue
         if path.is_symlink():
             _record_exclusion(excluded_files, excluded_counts, relative, "symlink")
+            excluded_metadata[relative] = _excluded_entry_metadata(path, relative)
             continue
         if not path.is_file():
             _record_exclusion(excluded_files, excluded_counts, relative, "special")
+            excluded_metadata[relative] = _excluded_entry_metadata(path, relative)
             continue
         if _is_secret_path(relative):
             _record_exclusion(excluded_files, excluded_counts, relative, "secret")
+            excluded_metadata[relative] = _excluded_entry_metadata(path, relative)
             continue
         data, reason = _read_text_bytes(path, relative)
         if reason:
             _record_exclusion(excluded_files, excluded_counts, relative, reason)
+            excluded_metadata[relative] = _excluded_entry_metadata(path, relative)
             continue
         assert data is not None
         eligible_files.append(relative)
@@ -350,6 +474,7 @@ def scan_project(project_root: Path | str) -> dict[str, Any]:
         "eligible_file_sources": file_sources,
         "excluded_file_count_by_reason": dict(sorted(excluded_counts.items())),
         "excluded_files": excluded_files,
+        "excluded_file_metadata": dict(sorted(excluded_metadata.items())),
         "worktree_changes": _git_worktree_changes(root),
         "modules": [],
         "contracts": [],
@@ -367,15 +492,53 @@ def stable_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def _reject_symlink_path(path: Path) -> None:
+    """拒绝目标及任何现有祖先符号链接，避免写入逃逸到项目外。"""
+
+    absolute = Path(os.path.abspath(path))
+    system_aliases = {Path("/etc"), Path("/home"), Path("/tmp"), Path("/var")}
+    for candidate in reversed((absolute, *absolute.parents)):
+        # macOS 的这些根级目录是只读系统提供的固定别名，不属于项目可控祖先。
+        if candidate not in system_aliases and candidate.is_symlink():
+            raise InventoryError(f"拒绝经符号链接写入：{candidate}")
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """在已校验目录中原子替换文件，不跟随最终目标符号链接。"""
+
+    _reject_symlink_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_path(path)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        if path.exists():
+            os.chmod(temporary_path, path.stat().st_mode & 0o7777)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _reject_symlink_path(path)
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def write_json_if_changed(path: Path | str, value: Any) -> bool:
     """只有字节变化时才写文件，避免无变化更新时间或 Git diff。"""
 
     destination = Path(path)
     content = stable_json_bytes(value)
+    _reject_symlink_path(destination)
     if destination.exists() and destination.read_bytes() == content:
         return False
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(content)
+    _atomic_write_bytes(destination, content)
     return True
 
 
@@ -472,6 +635,26 @@ def validate_state(state: Any) -> None:
         calculated_exclusions[reason] = calculated_exclusions.get(reason, 0) + 1
     if state["excluded_file_count_by_reason"] != dict(sorted(calculated_exclusions.items())):
         raise InventoryError("excluded_file_count_by_reason 与 excluded_files 不一致。")
+    excluded_metadata = state.get("excluded_file_metadata")
+    if excluded_metadata is not None:
+        expected_metadata_paths = sorted(
+            excluded["path"] for excluded in excluded_files if not excluded["path"].endswith("/")
+        )
+        if not isinstance(excluded_metadata, dict) or sorted(excluded_metadata) != expected_metadata_paths:
+            raise InventoryError("excluded_file_metadata 必须与排除文件完整对应。")
+        for relative, metadata in excluded_metadata.items():
+            if not isinstance(metadata, dict) or set(metadata) != {
+                "file_type",
+                "mtime_ns",
+                "size",
+            }:
+                raise InventoryError(f"排除文件元数据字段无效：{relative}")
+            if metadata["file_type"] not in {"file", "symlink", "directory", "special"}:
+                raise InventoryError(f"排除文件类型无效：{relative}")
+            if type(metadata["mtime_ns"]) is not int or type(metadata["size"]) is not int:
+                raise InventoryError(f"排除文件元数据必须是整数：{relative}")
+            if metadata["size"] < 0:
+                raise InventoryError(f"排除文件大小不能为负数：{relative}")
     worktree_changes = state["worktree_changes"]
     if not isinstance(worktree_changes, list) or worktree_changes != sorted(
         worktree_changes, key=lambda item: (item.get("path", ""), item.get("status", ""))
@@ -572,6 +755,23 @@ def _commit_is_ancestor(project_root: Path, ancestor: str) -> bool:
     return result.returncode == 0
 
 
+def _committed_changed_paths(project_root: Path, indexed_commit: str) -> list[str]:
+    """只读取基线到 HEAD 的 Git 路径元数据，不打开或哈希工作树文件。"""
+
+    result = run_git(
+        project_root,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        f"{indexed_commit}..HEAD",
+        "--",
+    )
+    return sorted({path for path in result.stdout.split("\0") if path})
+
+
 def _path_in_root(path: str, root: str) -> bool:
     """按路径分段匹配模块根，避免 src/a 与 src/ab 错配。"""
 
@@ -584,6 +784,81 @@ def _changed_paths(previous: dict[str, str], current: dict[str, str]) -> list[st
 
     all_paths = set(previous) | set(current)
     return sorted(path for path in all_paths if previous.get(path) != current.get(path))
+
+
+def _worktree_only_changed_paths(
+    previous: list[dict[str, str]],
+    current: list[dict[str, str]],
+    content_changed: Sequence[str],
+) -> list[str]:
+    """找出未被合格文件指纹覆盖的 Git 工作树变化，且只暴露路径事实。"""
+
+    def record(change: dict[str, str]) -> tuple[str, str, str]:
+        return (change["path"], change["status"], change.get("old_path", ""))
+
+    changed_records = {record(change) for change in previous} ^ {
+        record(change) for change in current
+    }
+    paths: set[str] = set()
+    for path, _status, old_path in changed_records:
+        paths.add(path)
+        if old_path:
+            paths.add(old_path)
+    return sorted(paths - set(content_changed))
+
+
+def _excluded_metadata_changed_paths(
+    previous: dict[str, dict[str, Any]], current: dict[str, dict[str, Any]]
+) -> list[str]:
+    """比较不含内容与哈希的排除项元数据，覆盖 Git 状态不变的秘密修改。"""
+
+    all_paths = set(previous) | set(current)
+    return sorted(path for path in all_paths if previous.get(path) != current.get(path))
+
+
+def _structural_change_kind(relative_path: str) -> str | None:
+    """按文档列出的机械路径证据识别必须全量重扫的结构入口。"""
+
+    path = PurePosixPath(relative_path)
+    lowered_parts = tuple(part.lower() for part in path.parts)
+    name = path.name.lower()
+    normalized_segments = {
+        part.replace("_", "-") for part in lowered_parts[:-1]
+    }
+    normalized_stem = path.stem.lower().replace("_", "-")
+    stem_tokens = set(re.split(r"[^a-z0-9]+", path.stem.lower()))
+    path_tokens = set(lowered_parts[:-1]) | stem_tokens
+    if path.suffix.lower() == ".proto":
+        return "Protocol Buffers schema"
+    if (
+        normalized_segments & STRUCTURAL_REGISTRY_SEGMENTS
+        or normalized_stem in STRUCTURAL_REGISTRY_SEGMENTS
+    ):
+        return "共享注册表"
+    for token, kind in STRUCTURAL_PATH_TOKEN_KINDS.items():
+        if token in path_tokens:
+            return kind
+    if "ci" in normalized_segments:
+        return "CI 入口"
+    if (
+        name in STRUCTURAL_CI_BASENAMES
+        or name.startswith("jenkinsfile")
+        or name.endswith("jenkinsfile")
+    ):
+        return "CI 入口"
+    playwright_prefix = "playwright.config."
+    if (
+        name.startswith(playwright_prefix)
+        and name[len(playwright_prefix) :] in PLAYWRIGHT_CONFIG_SUFFIXES
+    ):
+        return "测试入口"
+    if name in STRUCTURAL_ENTRY_BASENAMES:
+        return "包管理、构建或测试入口"
+    if len(lowered_parts) >= 2 and lowered_parts[:2] == (".github", "workflows"):
+        return "CI 入口"
+    if lowered_parts and lowered_parts[0] in {".circleci", ".buildkite"}:
+        return "CI 入口"
+    return None
 
 
 def analyze_changes(project_root: Path | str, state: dict[str, Any]) -> dict[str, Any]:
@@ -604,10 +879,32 @@ def analyze_changes(project_root: Path | str, state: dict[str, Any]) -> dict[str
             "reasons": ["indexed_commit 不存在或不是当前 HEAD 的祖先"],
         }
 
+    previous_excluded_metadata = state.get("excluded_file_metadata")
+    if previous_excluded_metadata is None:
+        return {
+            "status": "full_rescan_required",
+            "mode": "full-rescan",
+            "risk_level": "R3",
+            "changed_files": [],
+            "impacted_modules": [],
+            "consumer_files": [],
+            "test_candidates": [],
+            "reasons": ["旧状态缺少排除文件元数据，无法安全证明工作树未变化"],
+        }
+
     changed = _changed_paths(
         state["eligible_file_fingerprints"], current["eligible_file_fingerprints"]
     )
-    if not changed:
+    committed_only = sorted(
+        set(_committed_changed_paths(root, state["indexed_commit"])) - set(changed)
+    )
+    excluded_metadata_changed = _excluded_metadata_changed_paths(
+        previous_excluded_metadata, current["excluded_file_metadata"]
+    )
+    worktree_only = _worktree_only_changed_paths(
+        state["worktree_changes"], current["worktree_changes"], changed
+    )
+    if not changed and not committed_only and not worktree_only and not excluded_metadata_changed:
         return {
             "status": "项目档案已是最新",
             "mode": "no-change",
@@ -619,7 +916,6 @@ def analyze_changes(project_root: Path | str, state: dict[str, Any]) -> dict[str
             "reasons": [],
         }
 
-    module_by_id = {module["id"]: module for module in state["modules"]}
     impacted: set[str] = set()
     tests: set[str] = set()
     unmapped: list[str] = []
@@ -635,6 +931,7 @@ def analyze_changes(project_root: Path | str, state: dict[str, Any]) -> dict[str
         tests.update(module.get("tests", []))
 
     consumers: set[str] = set()
+    unmapped_consumers: list[str] = []
     contract_changes: list[dict[str, Any]] = []
     for contract in state["contracts"]:
         if contract["path"] not in changed:
@@ -644,10 +941,16 @@ def analyze_changes(project_root: Path | str, state: dict[str, Any]) -> dict[str
         for consumer in contract["consumers"]:
             if consumer == "UNKNOWN":
                 continue
-            for module_id, module in module_by_id.items():
-                if any(_path_in_root(consumer, item) for item in module["roots"]):
-                    impacted.add(module_id)
-                    tests.update(module.get("tests", []))
+            matched = [
+                module
+                for module in state["modules"]
+                if any(_path_in_root(consumer, item) for item in module["roots"])
+            ]
+            if len(matched) != 1:
+                unmapped_consumers.append(consumer)
+                continue
+            impacted.add(matched[0]["id"])
+            tests.update(matched[0].get("tests", []))
 
     reasons: list[str] = []
     mode = "incremental"
@@ -660,16 +963,56 @@ def analyze_changes(project_root: Path | str, state: dict[str, Any]) -> dict[str
         mode = "full-rescan"
         risk_level = "R3"
         reasons.append("公开契约的直接消费者为 UNKNOWN")
+    if unmapped_consumers:
+        mode = "full-rescan"
+        risk_level = "R3"
+        reasons.append(
+            "公开契约消费者无法唯一映射到模块："
+            + ", ".join(sorted(set(unmapped_consumers)))
+        )
     if any(contract.get("force_full_rescan") is True for contract in contract_changes):
         mode = "full-rescan"
         risk_level = "R3"
         reasons.append("变化命中状态中声明的强制全量重扫契约")
+    structural_changes = [
+        (path, kind)
+        for path in sorted(set(changed) | set(committed_only) | set(worktree_only))
+        if (kind := _structural_change_kind(path))
+    ]
+    if structural_changes:
+        mode = "full-rescan"
+        risk_level = "R3"
+        reasons.append(
+            "文档规定的结构变化要求全量重扫："
+            + ", ".join(f"{path}（{kind}）" for path, kind in structural_changes)
+        )
+    if worktree_only:
+        mode = "full-rescan"
+        risk_level = "R3"
+        reasons.append("Git 工作树变化未被合格文件指纹覆盖：" + ", ".join(worktree_only))
+    if committed_only:
+        mode = "full-rescan"
+        risk_level = "R3"
+        reasons.append(
+            "Git 已提交变化未被合格文件指纹覆盖：" + ", ".join(committed_only)
+        )
+    if excluded_metadata_changed:
+        mode = "full-rescan"
+        risk_level = "R3"
+        reasons.append(
+            "排除文件元数据变化要求全量重扫：" + ", ".join(excluded_metadata_changed)
+        )
 
     return {
         "status": "full_rescan_required" if mode == "full-rescan" else "changes_detected",
         "mode": mode,
         "risk_level": risk_level,
-        "changed_files": changed,
+        "changed_files": sorted(
+            set(changed)
+            | set(committed_only)
+            | set(worktree_only)
+            | set(excluded_metadata_changed)
+        ),
         "impacted_modules": sorted(impacted),
         "consumer_files": sorted(consumers),
         "test_candidates": sorted(tests),
@@ -701,6 +1044,7 @@ def refresh_state_inventory(
         "eligible_file_sources",
         "excluded_file_count_by_reason",
         "excluded_files",
+        "excluded_file_metadata",
         "worktree_changes",
     ):
         refreshed[field] = inventory[field]
@@ -756,6 +1100,7 @@ def ensure_agents_managed_block(path: Path | str) -> bool:
     """安全创建或校正根 AGENTS 托管块，块外内容逐字保留。"""
 
     agents_path = Path(path)
+    _reject_symlink_path(agents_path)
     original = agents_path.read_text(encoding="utf-8") if agents_path.exists() else ""
     starts = original.count(AGENTS_START)
     ends = original.count(AGENTS_END)
@@ -770,7 +1115,7 @@ def ensure_agents_managed_block(path: Path | str) -> bool:
         raise InventoryError("AGENTS 托管块标记缺失、重复或不成对。")
     if updated == original:
         return False
-    agents_path.write_text(updated, encoding="utf-8")
+    _atomic_write_bytes(agents_path, updated.encode("utf-8"))
     return True
 
 
@@ -781,6 +1126,7 @@ def ensure_skill_links(project_root: Path | str, package_root: Path | str) -> li
     package = Path(package_root).resolve()
     validate_package_location(project, package)
     links_root = project / ".agents" / "skills"
+    _reject_symlink_path(links_root)
     plans: list[tuple[Path, Path]] = []
     for skill_name in ("project-initialize", "project-update"):
         link = links_root / skill_name
@@ -794,6 +1140,7 @@ def ensure_skill_links(project_root: Path | str, package_root: Path | str) -> li
         plans.append((link, expected))
     # 先完成全部冲突预检再落盘，避免第二个目标冲突时留下半套链接。
     links_root.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_path(links_root)
     created: list[str] = []
     for link, expected in plans:
         link.symlink_to(expected)

