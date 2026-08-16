@@ -1,6 +1,6 @@
 interface:
   display_name: "项目更新"
-  short_description: "按代码变化增量同步 AI Constraints 项目档案"
-  default_prompt: "使用 $project-update 增量同步当前项目的 AI Constraints 档案。"
+  short_description: "任务收尾按变化同步项目档案"
+  default_prompt: "使用 $project-update 检查并同步当前项目档案；稳定事实未变化时保持零 diff。"
 policy:
   allow_implicit_invocation: false
